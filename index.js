@@ -55,6 +55,21 @@ async function run() {
       }
     });
 
+    // Get user data by email
+    app.get('/users', async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+        const user = await collection.findOne({ email });
+        if (!user) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+        res.json(user);
+      } catch (err) {
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
     // You can add more routes here...
 
   } catch (err) {
