@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 const multer = require('multer');
 const { v2: cloudinary } = require('cloudinary');
 require('dotenv').config();
@@ -36,6 +36,7 @@ async function run() {
     const db = client.db("earnzyDB");
     const usersCollection = db.collection("users");
     const tasksCollection = db.collection("tasks");
+    const submissionsCollection = db.collection("submissions");
 
     app.get("/", (req, res) => {
       res.send("Server is running!");
@@ -176,6 +177,417 @@ async function run() {
         });
       } catch (err) {
         console.error('Task creation error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Buyer dashboard endpoint
+    app.get('/buyer/dashboard', async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        // Get buyer info
+        const buyer = await usersCollection.findOne({ email });
+        if (!buyer) {
+          return res.status(404).json({ error: 'Buyer not found' });
+        }
+
+        // Get buyer's tasks
+        const tasks = await tasksCollection.find({ buyerEmail: email }).toArray();
+        
+        // Calculate stats
+        const totalTasks = tasks.length;
+        const totalPayments = tasks.reduce((sum, task) => sum + (task.totalPayable || 0), 0);
+        
+        // Get pending submissions for buyer's tasks
+        const taskIds = tasks.map(task => task._id);
+        const pendingSubmissions = await submissionsCollection.find({
+          taskId: { $in: taskIds },
+          status: 'pending'
+        }).toArray();
+
+        // Get worker details for submissions
+        const submissionsWithDetails = await Promise.all(
+          pendingSubmissions.map(async (submission) => {
+            const worker = await usersCollection.findOne({ email: submission.workerEmail });
+            const task = tasks.find(t => t._id.toString() === submission.taskId.toString());
+            
+            return {
+              ...submission,
+              worker: {
+                name: worker?.name || 'Unknown',
+                email: worker?.email || '',
+                profilePic: worker?.profilePic || ''
+              },
+              task: {
+                title: task?.title || 'Unknown Task',
+                description: task?.detail || ''
+              },
+              payableAmount: task?.payableAmount || 0
+            };
+          })
+        );
+
+        const pendingWorkers = pendingSubmissions.length;
+
+        res.json({
+          stats: {
+            totalTasks,
+            pendingWorkers,
+            totalPayments
+          },
+          pendingSubmissions: submissionsWithDetails
+        });
+      } catch (err) {
+        console.error('Buyer dashboard error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Approve submission endpoint
+    app.put('/submissions/:id/approve', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { buyerEmail } = req.body;
+
+        if (!buyerEmail) {
+          return res.status(400).json({ error: 'Buyer email is required' });
+        }
+
+        // Get submission
+        const submission = await submissionsCollection.findOne({ _id: new ObjectId(id) });
+        if (!submission) {
+          return res.status(404).json({ error: 'Submission not found' });
+        }
+
+        // Get task to verify ownership and get payment amount
+        const task = await tasksCollection.findOne({ _id: submission.taskId });
+        if (!task || task.buyerEmail !== buyerEmail) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Update submission status
+        await submissionsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: 'approved',
+              approvedAt: new Date()
+            }
+          }
+        );
+
+        // Add coins to worker
+        await usersCollection.updateOne(
+          { email: submission.workerEmail },
+          { $inc: { coins: task.payableAmount } }
+        );
+
+        res.json({ message: 'Submission approved successfully' });
+      } catch (err) {
+        console.error('Approve submission error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Reject submission endpoint
+    app.put('/submissions/:id/reject', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { buyerEmail } = req.body;
+
+        if (!buyerEmail) {
+          return res.status(400).json({ error: 'Buyer email is required' });
+        }
+
+        // Get submission
+        const submission = await submissionsCollection.findOne({ _id: new ObjectId(id) });
+        if (!submission) {
+          return res.status(404).json({ error: 'Submission not found' });
+        }
+
+        // Get task to verify ownership
+        const task = await tasksCollection.findOne({ _id: submission.taskId });
+        if (!task || task.buyerEmail !== buyerEmail) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Update submission status
+        await submissionsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: 'rejected',
+              rejectedAt: new Date()
+            }
+          }
+        );
+
+        res.json({ message: 'Submission rejected successfully' });
+      } catch (err) {
+        console.error('Reject submission error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Create sample submission data (for testing)
+    app.post('/create-sample-data', async (req, res) => {
+      try {
+        // Get first task and create sample submissions
+        const task = await tasksCollection.findOne({ status: 'active' });
+        if (!task) {
+          return res.status(404).json({ error: 'No active tasks found' });
+        }
+
+        // Create sample workers if they don't exist
+        const sampleWorkers = [
+          {
+            name: 'John Doe',
+            email: 'john.worker@example.com',
+            profilePic: 'https://ui-avatars.com/api/?name=John+Doe',
+            role: 'worker',
+            coins: 25,
+            createdAt: new Date()
+          },
+          {
+            name: 'Jane Smith',
+            email: 'jane.worker@example.com',
+            profilePic: 'https://ui-avatars.com/api/?name=Jane+Smith',
+            role: 'worker',
+            coins: 15,
+            createdAt: new Date()
+          }
+        ];
+
+        // Insert workers if they don't exist
+        for (const worker of sampleWorkers) {
+          const existingWorker = await usersCollection.findOne({ email: worker.email });
+          if (!existingWorker) {
+            await usersCollection.insertOne(worker);
+          }
+        }
+
+        // Create sample submissions
+        const sampleSubmissions = [
+          {
+            taskId: task._id,
+            workerEmail: 'john.worker@example.com',
+            submissionText: 'I have completed the task as requested. Here is my submission with detailed explanation of the work done.',
+            attachments: [
+              {
+                name: 'screenshot.png',
+                url: 'https://example.com/screenshot.png'
+              }
+            ],
+            status: 'pending',
+            submittedAt: new Date()
+          },
+          {
+            taskId: task._id,
+            workerEmail: 'jane.worker@example.com',
+            submissionText: 'Task completed successfully. I have followed all the instructions and provided the required proof.',
+            attachments: [
+              {
+                name: 'proof.jpg',
+                url: 'https://example.com/proof.jpg'
+              }
+            ],
+            status: 'pending',
+            submittedAt: new Date()
+          }
+        ];
+
+        // Insert submissions
+        await submissionsCollection.insertMany(sampleSubmissions);
+
+        res.json({ message: 'Sample data created successfully' });
+      } catch (err) {
+        console.error('Create sample data error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get tasks by buyer email
+    app.get('/tasks', async (req, res) => {
+      try {
+        const { buyer } = req.query;
+        if (!buyer) return res.status(400).json({ error: 'Buyer email is required' });
+
+        const tasks = await tasksCollection.find({ buyerEmail: buyer }).toArray();
+        
+        // Format dates for frontend
+        const formattedTasks = tasks.map(task => ({
+          ...task,
+          completionDate: task.completionDate.toISOString().split('T')[0] // Format as YYYY-MM-DD
+        }));
+
+        res.json(formattedTasks);
+      } catch (err) {
+        console.error('Get tasks error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Update task
+    app.put('/tasks/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { 
+          title, 
+          detail, 
+          requiredWorkers, 
+          payableAmount, 
+          completionDate, 
+          submissionInfo, 
+          imageUrl,
+          buyerEmail 
+        } = req.body;
+
+        console.log('Update task request:', { id, title, detail, requiredWorkers, payableAmount, completionDate, submissionInfo, imageUrl, buyerEmail });
+
+        // Validate ObjectId format
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid task ID format' });
+        }
+
+        if (!title || !detail || !requiredWorkers || !payableAmount || !completionDate || !submissionInfo || !buyerEmail) {
+          return res.status(400).json({ error: 'All fields are required' });
+        }
+
+        // Validate numeric fields
+        if (isNaN(requiredWorkers) || isNaN(payableAmount) || Number(requiredWorkers) <= 0 || Number(payableAmount) <= 0) {
+          return res.status(400).json({ error: 'Required workers and payable amount must be positive numbers' });
+        }
+
+        // Validate date
+        const parsedDate = new Date(completionDate);
+        if (isNaN(parsedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid completion date' });
+        }
+
+        // Verify task ownership
+        const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        if (!task) {
+          return res.status(404).json({ error: 'Task not found' });
+        }
+
+        if (task.buyerEmail !== buyerEmail) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Check if payment amount changed and handle coin adjustment
+        const oldTotalPayable = task.totalPayable || 0;
+        const newTotalPayable = Number(requiredWorkers) * Number(payableAmount);
+        const coinDifference = newTotalPayable - oldTotalPayable;
+
+        console.log('Payment calculation:', { oldTotalPayable, newTotalPayable, coinDifference });
+
+        // If payment increased, check if buyer has enough coins
+        if (coinDifference > 0) {
+          const buyer = await usersCollection.findOne({ email: buyerEmail });
+          if (!buyer || buyer.coins < coinDifference) {
+            return res.status(400).json({ error: 'Insufficient coins for increased payment' });
+          }
+        }
+
+        // Update task
+        const updateResult = await tasksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              title,
+              detail,
+              requiredWorkers: Number(requiredWorkers),
+              payableAmount: Number(payableAmount),
+              completionDate: parsedDate,
+              submissionInfo,
+              imageUrl: imageUrl || '',
+              totalPayable: newTotalPayable,
+              updatedAt: new Date()
+            }
+          }
+        );
+
+        console.log('Task update result:', updateResult);
+
+        // Adjust buyer's coins if payment amount changed
+        if (coinDifference !== 0) {
+          const coinUpdateResult = await usersCollection.updateOne(
+            { email: buyerEmail },
+            { $inc: { coins: -coinDifference } }
+          );
+          console.log('Coin update result:', coinUpdateResult);
+        }
+
+        // Get updated user coins
+        const updatedUser = await usersCollection.findOne({ email: buyerEmail });
+
+        res.json({ 
+          message: 'Task updated successfully',
+          coinDifference,
+          remainingCoins: updatedUser.coins
+        });
+      } catch (err) {
+        console.error('Update task error:', err);
+        console.error('Error stack:', err.stack);
+        res.status(500).json({ error: 'Server error: ' + err.message });
+      }
+    });
+
+    // Delete task
+    app.delete('/tasks/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { buyerEmail } = req.body;
+
+        if (!buyerEmail) {
+          return res.status(400).json({ error: 'Buyer email is required' });
+        }
+
+        // Get task to verify ownership and calculate refund
+        const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        if (!task) {
+          return res.status(404).json({ error: 'Task not found' });
+        }
+
+        if (task.buyerEmail !== buyerEmail) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Check if task has approved submissions (shouldn't refund if work is done)
+        const approvedSubmissions = await submissionsCollection.countDocuments({
+          taskId: new ObjectId(id),
+          status: 'approved'
+        });
+
+        // Calculate refund amount (total - approved submissions)
+        const refundAmount = (task.requiredWorkers - approvedSubmissions) * task.payableAmount;
+
+        // Delete task
+        await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+
+        // Delete related submissions
+        await submissionsCollection.deleteMany({ taskId: new ObjectId(id) });
+
+        // Refund coins if there are any to refund
+        if (refundAmount > 0) {
+          await usersCollection.updateOne(
+            { email: buyerEmail },
+            { $inc: { coins: refundAmount } }
+          );
+        }
+
+        // Get updated user coins
+        const updatedUser = await usersCollection.findOne({ email: buyerEmail });
+
+        res.json({ 
+          message: 'Task deleted successfully',
+          refundAmount,
+          remainingCoins: updatedUser.coins
+        });
+      } catch (err) {
+        console.error('Delete task error:', err);
         res.status(500).json({ error: 'Server error' });
       }
     });
