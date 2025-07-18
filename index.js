@@ -385,6 +385,253 @@ async function run() {
       }
     });
 
+    // Admin dashboard stats
+    app.get('/admin/dashboard', async (req, res) => {
+      try {
+        // Get total workers (users with role 'worker')
+        const totalWorkers = await usersCollection.countDocuments({ role: 'worker' });
+        
+        // Get total buyers (users with role 'buyer')
+        const totalBuyers = await usersCollection.countDocuments({ role: 'buyer' });
+        
+        // Get total available coins (sum of all users' coins)
+        const coinAggregation = await usersCollection.aggregate([
+          { $group: { _id: null, totalCoins: { $sum: '$coins' } } }
+        ]).toArray();
+        const totalAvailableCoins = coinAggregation.length > 0 ? coinAggregation[0].totalCoins : 0;
+        
+        // Get total payments (you might want to adjust this based on your payment collection)
+        // For now, assuming we count successful coin purchases
+        const totalPayments = await usersCollection.aggregate([
+          { $group: { _id: null, totalPayments: { $sum: '$totalPurchased' } } }
+        ]).toArray();
+        const totalPaymentAmount = totalPayments.length > 0 ? totalPayments[0].totalPayments : 0;
+
+        res.json({
+          totalWorkers,
+          totalBuyers,
+          totalAvailableCoins,
+          totalPayments: totalPaymentAmount || 0
+        });
+      } catch (err) {
+        console.error('Admin dashboard error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get pending withdrawal requests
+    app.get('/admin/withdrawals/pending', async (req, res) => {
+      try {
+        const pendingWithdrawals = await withdrawalsCollection.find({
+          status: 'pending'
+        }).sort({ withdrawDate: -1 }).toArray();
+
+        // Format dates for frontend
+        const formattedWithdrawals = pendingWithdrawals.map(withdrawal => ({
+          ...withdrawal,
+          withdrawalDate: withdrawal.withdrawDate.toISOString().split('T')[0],
+          withdrawDate: withdrawal.withdrawDate.toISOString()
+        }));
+
+        res.json(formattedWithdrawals);
+      } catch (err) {
+        console.error('Get pending withdrawals error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Approve withdrawal request
+    app.put('/admin/withdrawals/:id/approve', async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid withdrawal ID' });
+        }
+
+        // Get the withdrawal request
+        const withdrawal = await withdrawalsCollection.findOne({ _id: new ObjectId(id) });
+        if (!withdrawal) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+
+        if (withdrawal.status !== 'pending') {
+          return res.status(400).json({ error: 'Withdrawal request is not pending' });
+        }
+
+        // Update withdrawal status to approved
+        await withdrawalsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: 'approved',
+              approvedAt: new Date()
+            } 
+          }
+        );
+
+        // Note: Coins were already deducted when the withdrawal was created
+        // Create notification for user
+        await createNotification(
+          `Your withdrawal request of ${withdrawal.withdrawalCoin} coins ($${withdrawal.withdrawalAmount}) has been approved and processed.`,
+          withdrawal.workerEmail,
+          '/dashboard/withdrawals'
+        );
+
+        res.json({ message: 'Withdrawal request approved successfully' });
+      } catch (err) {
+        console.error('Approve withdrawal error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get all users for admin management
+    app.get('/admin/users', async (req, res) => {
+      try {
+        const users = await usersCollection.find({}).sort({ createdAt: -1 }).toArray();
+        
+        // Format user data for frontend
+        const formattedUsers = users.map(user => ({
+          _id: user._id,
+          name: user.name || user.displayName || user.email.split('@')[0],
+          email: user.email,
+          photoURL: user.photoURL || user.profilePic || null,
+          role: user.role || 'worker',
+          coins: user.coins || 0,
+          createdAt: user.createdAt
+        }));
+
+        res.json(formattedUsers);
+      } catch (err) {
+        console.error('Get all users error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Update user role
+    app.put('/admin/users/:email/role', async (req, res) => {
+      try {
+        const { email } = req.params;
+        const { role } = req.body;
+
+        if (!email || !role) {
+          return res.status(400).json({ error: 'Email and role are required' });
+        }
+
+        if (!['admin', 'buyer', 'worker'].includes(role)) {
+          return res.status(400).json({ error: 'Invalid role. Must be admin, buyer, or worker' });
+        }
+
+        // Update user role
+        const result = await usersCollection.updateOne(
+          { email: email },
+          { $set: { role: role } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Create notification for user
+        await createNotification(
+          `Your account role has been updated to ${role} by an administrator.`,
+          email,
+          '/dashboard'
+        );
+
+        res.json({ message: 'User role updated successfully' });
+      } catch (err) {
+        console.error('Update user role error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Delete user
+    app.delete('/admin/users/:email', async (req, res) => {
+      try {
+        const { email } = req.params;
+
+        if (!email) {
+          return res.status(400).json({ error: 'Email is required' });
+        }
+
+        // Check if user exists
+        const user = await usersCollection.findOne({ email: email });
+        if (!user) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Delete user from database
+        await usersCollection.deleteOne({ email: email });
+
+        // Also delete related data
+        await submissionsCollection.deleteMany({ workerEmail: email });
+        await submissionsCollection.deleteMany({ buyerEmail: email });
+        await tasksCollection.deleteMany({ buyerEmail: email });
+        await withdrawalsCollection.deleteMany({ workerEmail: email });
+        await notificationsCollection.deleteMany({ toEmail: email });
+
+        res.json({ message: 'User deleted successfully' });
+      } catch (err) {
+        console.error('Delete user error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get all tasks for admin management
+    app.get('/admin/tasks', async (req, res) => {
+      try {
+        const tasks = await tasksCollection.find({}).sort({ createdAt: -1 }).toArray();
+        
+        // Format task data for frontend
+        const formattedTasks = tasks.map(task => ({
+          ...task,
+          completionDate: task.completionDate ? task.completionDate.toISOString().split('T')[0] : null,
+          createdAt: task.createdAt ? task.createdAt.toISOString() : null
+        }));
+
+        res.json(formattedTasks);
+      } catch (err) {
+        console.error('Get all tasks error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Delete task
+    app.delete('/admin/tasks/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid task ID' });
+        }
+
+        // Check if task exists
+        const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        if (!task) {
+          return res.status(404).json({ error: 'Task not found' });
+        }
+
+        // Delete task from database
+        await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+
+        // Also delete related submissions for this task
+        await submissionsCollection.deleteMany({ taskId: new ObjectId(id) });
+
+        // Create notification for the task buyer
+        await createNotification(
+          `Your task "${task.title}" has been deleted by an administrator.`,
+          task.buyerEmail,
+          '/dashboard'
+        );
+
+        res.json({ message: 'Task deleted successfully' });
+      } catch (err) {
+        console.error('Delete task error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
     // Worker dashboard endpoint
     app.get('/worker/dashboard', async (req, res) => {
       try {
