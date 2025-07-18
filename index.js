@@ -290,6 +290,101 @@ async function run() {
       }
     });
 
+    // Create withdrawal request
+    app.post('/worker/withdraw', async (req, res) => {
+      try {
+        const { workerEmail, workerName, withdrawalCoin, withdrawalAmount, paymentSystem, accountNumber } = req.body;
+
+        if (!workerEmail || !workerName || !withdrawalCoin || !withdrawalAmount || !paymentSystem || !accountNumber) {
+          return res.status(400).json({ error: 'All fields are required' });
+        }
+
+        // Validate withdrawal amount (20 coins = 1 dollar)
+        const expectedAmount = withdrawalCoin / 20;
+        if (Math.abs(withdrawalAmount - expectedAmount) > 0.01) {
+          return res.status(400).json({ error: 'Invalid withdrawal amount calculation' });
+        }
+
+        // Check if user has enough coins
+        const user = await usersCollection.findOne({ email: workerEmail });
+        if (!user) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        if (user.coins < withdrawalCoin) {
+          return res.status(400).json({ error: 'Insufficient coins' });
+        }
+
+        // Check minimum withdrawal (200 coins = 10 dollars)
+        if (withdrawalCoin < 200) {
+          return res.status(400).json({ error: 'Minimum withdrawal is 200 coins ($10)' });
+        }
+
+        // Create withdrawal request
+        const withdrawal = {
+          workerEmail,
+          workerName,
+          withdrawalCoin,
+          withdrawalAmount,
+          paymentSystem,
+          accountNumber,
+          withdrawDate: new Date(),
+          status: 'pending'
+        };
+
+        const result = await withdrawalsCollection.insertOne(withdrawal);
+
+        // Deduct coins from user account
+        await usersCollection.updateOne(
+          { email: workerEmail },
+          { $inc: { coins: -withdrawalCoin } }
+        );
+
+        // Create notification for user
+        await createNotification(
+          `Your withdrawal request of ${withdrawalCoin} coins ($${withdrawalAmount}) has been submitted and is pending approval.`,
+          workerEmail,
+          '/dashboard/withdrawals'
+        );
+
+        res.status(201).json({
+          message: 'Withdrawal request submitted successfully',
+          withdrawalId: result.insertedId
+        });
+      } catch (err) {
+        console.error('Create withdrawal error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get worker withdrawals
+    app.get('/worker/withdrawals', async (req, res) => {
+      try {
+        const { workerEmail } = req.query;
+
+        if (!workerEmail) {
+          return res.status(400).json({ error: 'Worker email is required' });
+        }
+
+        // Get all withdrawals for the worker
+        const withdrawals = await withdrawalsCollection.find({
+          workerEmail: workerEmail
+        }).sort({ withdrawDate: -1 }).toArray();
+
+        // Format dates for frontend
+        const formattedWithdrawals = withdrawals.map(withdrawal => ({
+          ...withdrawal,
+          withdrawalDate: withdrawal.withdrawDate.toISOString().split('T')[0], // Format as YYYY-MM-DD
+          withdrawDate: withdrawal.withdrawDate.toISOString()
+        }));
+
+        res.json(formattedWithdrawals);
+      } catch (err) {
+        console.error('Get worker withdrawals error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
     // Worker dashboard endpoint
     app.get('/worker/dashboard', async (req, res) => {
       try {
