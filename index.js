@@ -632,6 +632,33 @@ async function run() {
       }
     });
 
+    // Get top workers for home page
+    app.get('/top-workers', async (req, res) => {
+      try {
+        // Get top 6 workers (show all workers, not just those with coins > 0)
+        const topWorkers = await usersCollection.find({
+          role: 'worker'
+        }).sort({ coins: -1 }).limit(6).toArray();
+
+        console.log('Found workers:', topWorkers.length);
+        console.log('Workers data:', topWorkers.map(w => ({ name: w.name || w.displayName || w.email, coins: w.coins || 0 })));
+
+        // Format worker data for frontend
+        const formattedWorkers = topWorkers.map(worker => ({
+          _id: worker._id,
+          name: worker.name || worker.displayName || worker.email.split('@')[0],
+          email: worker.email,
+          photoURL: worker.photoURL || worker.profilePic || null,
+          coins: worker.coins || 0
+        }));
+
+        res.json(formattedWorkers);
+      } catch (err) {
+        console.error('Get top workers error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
     // Worker dashboard endpoint
     app.get('/worker/dashboard', async (req, res) => {
       try {
