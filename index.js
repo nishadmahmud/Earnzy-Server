@@ -50,6 +50,24 @@ async function run() {
     const usersCollection = db.collection("users");
     const tasksCollection = db.collection("tasks");
     const submissionsCollection = db.collection("submissions");
+    const notificationsCollection = db.collection("notifications");
+    const withdrawalsCollection = db.collection("withdrawals");
+
+    // Helper function to create notifications
+    const createNotification = async (message, toEmail, actionRoute) => {
+      try {
+        const notification = {
+          message,
+          toEmail,
+          actionRoute,
+          time: new Date(),
+          read: false
+        };
+        await notificationsCollection.insertOne(notification);
+      } catch (error) {
+        console.error('Error creating notification:', error);
+      }
+    };
 
     app.get("/", (req, res) => {
       res.send("Server is running!");
@@ -194,6 +212,140 @@ async function run() {
       }
     });
 
+    // Get available tasks for workers
+    app.get('/tasks/available', async (req, res) => {
+      try {
+        // Get all active tasks where required_workers > 0
+        const availableTasks = await tasksCollection.find({
+          status: 'active',
+          requiredWorkers: { $gt: 0 }
+        }).sort({ createdAt: -1 }).toArray();
+
+        // Format completion date for frontend
+        const formattedTasks = availableTasks.map(task => ({
+          ...task,
+          completionDate: task.completionDate.toISOString().split('T')[0] // Format as YYYY-MM-DD
+        }));
+
+        res.json(formattedTasks);
+      } catch (err) {
+        console.error('Get available tasks error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get task details by ID
+    app.get('/tasks/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid task ID' });
+        }
+
+        const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+        
+        if (!task) {
+          return res.status(404).json({ error: 'Task not found' });
+        }
+
+        // Format completion date for frontend
+        const formattedTask = {
+          ...task,
+          completionDate: task.completionDate.toISOString().split('T')[0]
+        };
+
+        res.json(formattedTask);
+      } catch (err) {
+        console.error('Get task details error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get worker submissions
+    app.get('/worker/submissions', async (req, res) => {
+      try {
+        const { workerEmail } = req.query;
+
+        if (!workerEmail) {
+          return res.status(400).json({ error: 'Worker email is required' });
+        }
+
+        // Get all submissions for the worker
+        const submissions = await submissionsCollection.find({
+          workerEmail: workerEmail
+        }).sort({ submittedAt: -1 }).toArray();
+
+        // Format dates for frontend
+        const formattedSubmissions = submissions.map(submission => ({
+          ...submission,
+          submissionDate: submission.submittedAt.toISOString().split('T')[0], // Format as YYYY-MM-DD
+          submittedAt: submission.submittedAt.toISOString()
+        }));
+
+        res.json(formattedSubmissions);
+      } catch (err) {
+        console.error('Get worker submissions error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Worker dashboard endpoint
+    app.get('/worker/dashboard', async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        // Get worker info
+        const worker = await usersCollection.findOne({ email });
+        if (!worker) {
+          return res.status(404).json({ error: 'Worker not found' });
+        }
+
+        // Get all submissions by worker
+        const allSubmissions = await submissionsCollection.find({ workerEmail: email }).toArray();
+        
+        // Get pending submissions
+        const pendingSubmissions = allSubmissions.filter(sub => sub.status === 'pending');
+        
+        // Get approved submissions with task details
+        const approvedSubmissions = allSubmissions.filter(sub => sub.status === 'approved');
+        
+        // Get task details for approved submissions
+        const approvedSubmissionsWithDetails = await Promise.all(
+          approvedSubmissions.map(async (submission) => {
+            const task = await tasksCollection.findOne({ _id: submission.taskId });
+            return {
+              ...submission,
+              task_title: task?.title || 'Unknown Task',
+              payable_amount: task?.payableAmount || 0,
+              buyer_name: task?.buyerName || 'Unknown Buyer',
+              submittedAt: submission.submittedAt,
+              approvedAt: submission.approvedAt
+            };
+          })
+        );
+
+        // Calculate total earnings (sum of approved submissions)
+        const totalEarnings = approvedSubmissionsWithDetails.reduce((sum, sub) => sum + sub.payable_amount, 0);
+
+        // Calculate stats
+        const stats = {
+          totalSubmissions: allSubmissions.length,
+          pendingSubmissions: pendingSubmissions.length,
+          totalEarnings: totalEarnings
+        };
+
+        res.json({
+          stats,
+          approvedSubmissions: approvedSubmissionsWithDetails.sort((a, b) => new Date(b.approvedAt) - new Date(a.approvedAt))
+        });
+      } catch (err) {
+        console.error('Worker dashboard error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
     // Buyer dashboard endpoint
     app.get('/buyer/dashboard', async (req, res) => {
       try {
@@ -297,6 +449,17 @@ async function run() {
           { $inc: { coins: task.payableAmount } }
         );
 
+        // Get buyer info for notification
+        const buyer = await usersCollection.findOne({ email: buyerEmail });
+        const buyerName = buyer?.name || 'Unknown Buyer';
+
+        // Create notification for worker
+        await createNotification(
+          `You have earned ${task.payableAmount} coins from ${buyerName} for completing "${task.title}"`,
+          submission.workerEmail,
+          '/dashboard'
+        );
+
         res.json({ message: 'Submission approved successfully' });
       } catch (err) {
         console.error('Approve submission error:', err);
@@ -337,9 +500,84 @@ async function run() {
           }
         );
 
+        // Get buyer info for notification
+        const buyer = await usersCollection.findOne({ email: buyerEmail });
+        const buyerName = buyer?.name || 'Unknown Buyer';
+
+        // Create notification for worker
+        await createNotification(
+          `Your submission for "${task.title}" has been rejected by ${buyerName}. Please review and resubmit if needed.`,
+          submission.workerEmail,
+          '/dashboard/submissions'
+        );
+
         res.json({ message: 'Submission rejected successfully' });
       } catch (err) {
         console.error('Reject submission error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Create submission endpoint
+    app.post('/submissions', async (req, res) => {
+      try {
+        const { taskId, workerEmail, submissionDetails } = req.body;
+
+        if (!taskId || !workerEmail || !submissionDetails) {
+          return res.status(400).json({ error: 'Task ID, worker email, and submission details are required' });
+        }
+
+        // Verify task exists
+        const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+        if (!task) {
+          return res.status(404).json({ error: 'Task not found' });
+        }
+
+        // Get worker info
+        const worker = await usersCollection.findOne({ email: workerEmail });
+        if (!worker) {
+          return res.status(404).json({ error: 'Worker not found' });
+        }
+
+        // Check if worker has already submitted for this task
+        const existingSubmission = await submissionsCollection.findOne({
+          taskId: new ObjectId(taskId),
+          workerEmail: workerEmail
+        });
+
+        if (existingSubmission) {
+          return res.status(400).json({ error: 'You have already submitted for this task' });
+        }
+
+        // Create submission with all required fields
+        const submission = {
+          taskId: new ObjectId(taskId),
+          taskTitle: task.title,
+          payableAmount: task.payableAmount,
+          workerEmail,
+          workerName: worker.name,
+          buyerName: task.buyerName,
+          buyerEmail: task.buyerEmail,
+          submissionDetails,
+          status: 'pending',
+          submittedAt: new Date()
+        };
+
+        const result = await submissionsCollection.insertOne(submission);
+
+        // Create notification for buyer
+        await createNotification(
+          `${worker.name} has submitted work for your task "${task.title}". Please review and approve/reject the submission.`,
+          task.buyerEmail,
+          '/dashboard'
+        );
+
+        res.status(201).json({
+          message: 'Submission created successfully',
+          submissionId: result.insertedId
+        });
+      } catch (err) {
+        console.error('Create submission error:', err);
         res.status(500).json({ error: 'Server error' });
       }
     });
@@ -672,6 +910,13 @@ async function run() {
         // Get updated user data
         const updatedUser = await usersCollection.findOne({ email: userEmail });
 
+        // Create notification for coin purchase
+        await createNotification(
+          `You have successfully purchased ${coinsToAdd} coins for $${(paymentIntent.amount / 100).toFixed(2)}. Your current balance is ${updatedUser.coins} coins.`,
+          userEmail,
+          '/dashboard/purchase-coin'
+        );
+
         // Send confirmation email
         try {
           await transporter.sendMail({
@@ -741,6 +986,295 @@ async function run() {
       } catch (err) {
         console.error('Payment history error:', err);
         res.status(500).json({ error: 'Failed to fetch payment history' });
+      }
+    });
+
+    // Withdrawal endpoints
+    
+    // Create withdrawal request
+    app.post('/withdrawals', async (req, res) => {
+      try {
+        const { workerEmail, amount, paymentSystem, accountNumber } = req.body;
+
+        if (!workerEmail || !amount || !paymentSystem || !accountNumber) {
+          return res.status(400).json({ error: 'All fields are required' });
+        }
+
+        // Get worker info
+        const worker = await usersCollection.findOne({ email: workerEmail });
+        if (!worker) {
+          return res.status(404).json({ error: 'Worker not found' });
+        }
+
+        // Check if worker has enough coins
+        const COIN_TO_DOLLAR = 20;
+        const requiredCoins = amount * COIN_TO_DOLLAR;
+        if (worker.coins < requiredCoins) {
+          return res.status(400).json({ error: 'Insufficient coins for withdrawal' });
+        }
+
+        // Create withdrawal request
+        const withdrawal = {
+          workerEmail,
+          workerName: worker.name,
+          amount: Number(amount),
+          paymentSystem,
+          accountNumber,
+          status: 'pending',
+          requestedAt: new Date()
+        };
+
+        const result = await withdrawalsCollection.insertOne(withdrawal);
+
+        // Deduct coins from worker
+        await usersCollection.updateOne(
+          { email: workerEmail },
+          { $inc: { coins: -requiredCoins } }
+        );
+
+        res.status(201).json({
+          message: 'Withdrawal request submitted successfully',
+          withdrawalId: result.insertedId
+        });
+      } catch (err) {
+        console.error('Create withdrawal error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Get withdrawal requests (for admin)
+    app.get('/withdrawals', async (req, res) => {
+      try {
+        const { status } = req.query;
+        
+        const query = status ? { status } : {};
+        const withdrawals = await withdrawalsCollection
+          .find(query)
+          .sort({ requestedAt: -1 })
+          .toArray();
+
+        res.json(withdrawals);
+      } catch (err) {
+        console.error('Get withdrawals error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Approve withdrawal request
+    app.put('/withdrawals/:id/approve', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { adminEmail } = req.body;
+
+        if (!adminEmail) {
+          return res.status(400).json({ error: 'Admin email is required' });
+        }
+
+        // Verify admin
+        const admin = await usersCollection.findOne({ email: adminEmail });
+        if (!admin || admin.role !== 'admin') {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Get withdrawal request
+        const withdrawal = await withdrawalsCollection.findOne({ _id: new ObjectId(id) });
+        if (!withdrawal) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+
+        if (withdrawal.status !== 'pending') {
+          return res.status(400).json({ error: 'Withdrawal request already processed' });
+        }
+
+        // Update withdrawal status
+        await withdrawalsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: 'approved',
+              approvedAt: new Date(),
+              approvedBy: adminEmail
+            }
+          }
+        );
+
+        // Create notification for worker
+        await createNotification(
+          `Your withdrawal request of $${withdrawal.amount} has been approved and processed. The amount will be sent to your ${withdrawal.paymentSystem} account.`,
+          withdrawal.workerEmail,
+          '/dashboard/withdrawals'
+        );
+
+        res.json({ message: 'Withdrawal request approved successfully' });
+      } catch (err) {
+        console.error('Approve withdrawal error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Reject withdrawal request
+    app.put('/withdrawals/:id/reject', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { adminEmail, reason } = req.body;
+
+        if (!adminEmail) {
+          return res.status(400).json({ error: 'Admin email is required' });
+        }
+
+        // Verify admin
+        const admin = await usersCollection.findOne({ email: adminEmail });
+        if (!admin || admin.role !== 'admin') {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Get withdrawal request
+        const withdrawal = await withdrawalsCollection.findOne({ _id: new ObjectId(id) });
+        if (!withdrawal) {
+          return res.status(404).json({ error: 'Withdrawal request not found' });
+        }
+
+        if (withdrawal.status !== 'pending') {
+          return res.status(400).json({ error: 'Withdrawal request already processed' });
+        }
+
+        // Update withdrawal status
+        await withdrawalsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: 'rejected',
+              rejectedAt: new Date(),
+              rejectedBy: adminEmail,
+              rejectionReason: reason || 'No reason provided'
+            }
+          }
+        );
+
+        // Refund coins to worker
+        const COIN_TO_DOLLAR = 20;
+        const refundCoins = withdrawal.amount * COIN_TO_DOLLAR;
+        await usersCollection.updateOne(
+          { email: withdrawal.workerEmail },
+          { $inc: { coins: refundCoins } }
+        );
+
+        // Create notification for worker
+        const reasonText = reason ? ` Reason: ${reason}` : '';
+        await createNotification(
+          `Your withdrawal request of $${withdrawal.amount} has been rejected and coins have been refunded to your account.${reasonText}`,
+          withdrawal.workerEmail,
+          '/dashboard/withdrawals'
+        );
+
+        res.json({ message: 'Withdrawal request rejected successfully' });
+      } catch (err) {
+        console.error('Reject withdrawal error:', err);
+        res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Notification endpoints
+    
+    // Get notifications for a user
+    app.get('/notifications', async (req, res) => {
+      try {
+        const { email } = req.query;
+        
+        if (!email) {
+          return res.status(400).json({ error: 'Email is required' });
+        }
+
+        // Get notifications for the user, sorted by newest first
+        const notifications = await notificationsCollection
+          .find({ toEmail: email })
+          .sort({ time: -1 })
+          .limit(50)
+          .toArray();
+
+        res.json(notifications);
+      } catch (err) {
+        console.error('Get notifications error:', err);
+        res.status(500).json({ error: 'Failed to fetch notifications' });
+      }
+    });
+
+    // Mark notification as read
+    app.put('/notifications/:id/read', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+          return res.status(400).json({ error: 'User email is required' });
+        }
+
+        // Update notification as read
+        const result = await notificationsCollection.updateOne(
+          { 
+            _id: new ObjectId(id),
+            toEmail: userEmail 
+          },
+          { $set: { read: true } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Notification not found' });
+        }
+
+        res.json({ message: 'Notification marked as read' });
+      } catch (err) {
+        console.error('Mark notification as read error:', err);
+        res.status(500).json({ error: 'Failed to mark notification as read' });
+      }
+    });
+
+    // Mark all notifications as read
+    app.put('/notifications/read-all', async (req, res) => {
+      try {
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+          return res.status(400).json({ error: 'User email is required' });
+        }
+
+        // Update all notifications as read for the user
+        await notificationsCollection.updateMany(
+          { toEmail: userEmail, read: false },
+          { $set: { read: true } }
+        );
+
+        res.json({ message: 'All notifications marked as read' });
+      } catch (err) {
+        console.error('Mark all notifications as read error:', err);
+        res.status(500).json({ error: 'Failed to mark all notifications as read' });
+      }
+    });
+
+    // Delete notification
+    app.delete('/notifications/:id', async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+          return res.status(400).json({ error: 'User email is required' });
+        }
+
+        // Delete notification
+        const result = await notificationsCollection.deleteOne({
+          _id: new ObjectId(id),
+          toEmail: userEmail
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Notification not found' });
+        }
+
+        res.json({ message: 'Notification deleted successfully' });
+      } catch (err) {
+        console.error('Delete notification error:', err);
+        res.status(500).json({ error: 'Failed to delete notification' });
       }
     });
 
