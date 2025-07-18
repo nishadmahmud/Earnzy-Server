@@ -3,7 +3,11 @@ const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
 const multer = require('multer');
 const { v2: cloudinary } = require('cloudinary');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
+
+// Initialize Stripe after loading environment variables
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -16,6 +20,15 @@ cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Configure nodemailer
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
 });
 
 // Configure multer for memory storage
@@ -589,6 +602,145 @@ async function run() {
       } catch (err) {
         console.error('Delete task error:', err);
         res.status(500).json({ error: 'Server error' });
+      }
+    });
+
+    // Stripe Payment Endpoints
+    
+    // Create payment intent
+    app.post('/create-payment-intent', async (req, res) => {
+      try {
+        const { amount, coins, userEmail } = req.body;
+        
+        // Validate input
+        if (!amount || !coins || !userEmail) {
+          return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        // Create payment intent
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(amount * 100), // Convert to cents
+          currency: 'usd',
+          automatic_payment_methods: {
+            enabled: true,
+          },
+          metadata: {
+            userEmail,
+            coins: coins.toString(),
+          },
+        });
+
+        res.json({
+          clientSecret: paymentIntent.client_secret,
+          paymentIntentId: paymentIntent.id,
+        });
+      } catch (err) {
+        console.error('Create payment intent error:', err);
+        res.status(500).json({ error: 'Failed to create payment intent' });
+      }
+    });
+
+    // Confirm payment and update user coins
+    app.post('/confirm-payment', async (req, res) => {
+      try {
+        const { paymentIntentId } = req.body;
+        
+        if (!paymentIntentId) {
+          return res.status(400).json({ error: 'Payment intent ID is required' });
+        }
+
+        // Retrieve payment intent from Stripe
+        const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+        
+        if (paymentIntent.status !== 'succeeded') {
+          return res.status(400).json({ error: 'Payment not successful' });
+        }
+
+        const { userEmail, coins } = paymentIntent.metadata;
+        const coinsToAdd = parseInt(coins);
+
+        // Update user coins in database
+        const result = await usersCollection.updateOne(
+          { email: userEmail },
+          { $inc: { coins: coinsToAdd } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Get updated user data
+        const updatedUser = await usersCollection.findOne({ email: userEmail });
+
+        // Send confirmation email
+        try {
+          await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: userEmail,
+            subject: 'Earnzy - Coin Purchase Confirmation',
+            html: `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #2563eb;">Payment Successful!</h2>
+                <p>Dear User,</p>
+                <p>Your coin purchase has been successfully processed.</p>
+                <div style="background-color: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                  <h3 style="margin: 0 0 10px 0;">Purchase Details:</h3>
+                  <p><strong>Coins Purchased:</strong> ${coinsToAdd}</p>
+                  <p><strong>Amount Paid:</strong> $${(paymentIntent.amount / 100).toFixed(2)}</p>
+                  <p><strong>Current Balance:</strong> ${updatedUser.coins} coins</p>
+                </div>
+                <p>Thank you for using Earnzy!</p>
+                <p>Best regards,<br>The Earnzy Team</p>
+              </div>
+            `
+          });
+        } catch (emailErr) {
+          console.error('Email sending error:', emailErr);
+          // Don't fail the request if email fails
+        }
+
+        res.json({
+          success: true,
+          message: 'Payment confirmed and coins added',
+          coins: updatedUser.coins,
+          coinsAdded: coinsToAdd
+        });
+      } catch (err) {
+        console.error('Confirm payment error:', err);
+        res.status(500).json({ error: 'Failed to confirm payment' });
+      }
+    });
+
+    // Get payment history
+    app.get('/payment-history', async (req, res) => {
+      try {
+        const { email } = req.query;
+        
+        if (!email) {
+          return res.status(400).json({ error: 'Email is required' });
+        }
+
+        // Get payment history from Stripe
+        const paymentIntents = await stripe.paymentIntents.list({
+          limit: 50,
+        });
+
+        // Filter payments for this user
+        const userPayments = paymentIntents.data
+          .filter(pi => pi.metadata.userEmail === email && pi.status === 'succeeded')
+          .map(pi => ({
+            id: pi.id,
+            amount: pi.amount / 100,
+            coins: parseInt(pi.metadata.coins),
+            date: new Date(pi.created * 1000),
+            status: pi.status
+          }))
+          .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+        res.json(userPayments);
+      } catch (err) {
+        console.error('Payment history error:', err);
+        res.status(500).json({ error: 'Failed to fetch payment history' });
       }
     });
 
