@@ -730,8 +730,14 @@ async function run() {
         // Get buyer's tasks
         const tasks = await tasksCollection.find({ buyerEmail: email }).toArray();
         
-        // Calculate stats
+        // Calculate stats according to requirements:
+        // 1. Total task count (tasks added by user)
         const totalTasks = tasks.length;
+        
+        // 2. Pending tasks (sum of all required_workers count of his added tasks)
+        const pendingTasks = tasks.reduce((sum, task) => sum + (task.requiredWorkers || 0), 0);
+        
+        // 3. Total payments paid by the user (sum of totalPayable for all tasks)
         const totalPayments = tasks.reduce((sum, task) => sum + (task.totalPayable || 0), 0);
         
         // Get pending submissions for buyer's tasks
@@ -750,9 +756,9 @@ async function run() {
             return {
               ...submission,
               worker: {
-                name: worker?.name || 'Unknown',
+                name: worker?.name || worker?.displayName || 'Unknown',
                 email: worker?.email || '',
-                profilePic: worker?.profilePic || ''
+                profilePic: worker?.profilePic || worker?.photoURL || ''
               },
               task: {
                 title: task?.title || 'Unknown Task',
@@ -763,12 +769,10 @@ async function run() {
           })
         );
 
-        const pendingWorkers = pendingSubmissions.length;
-
         res.json({
           stats: {
             totalTasks,
-            pendingWorkers,
+            pendingWorkers: pendingTasks, // This is the sum of required_workers
             totalPayments
           },
           pendingSubmissions: submissionsWithDetails
@@ -867,6 +871,12 @@ async function run() {
               rejectedAt: new Date()
             }
           }
+        );
+
+        // Increase required_workers by 1 (as per requirements)
+        await tasksCollection.updateOne(
+          { _id: submission.taskId },
+          { $inc: { requiredWorkers: 1 } }
         );
 
         // Get buyer info for notification
