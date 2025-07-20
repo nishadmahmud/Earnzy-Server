@@ -1567,6 +1567,31 @@ async function run() {
       }
     });
 
+    // Get all payments made by a buyer for their tasks
+    app.get('/buyer/payments', async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        // Find all tasks created by this buyer
+        const tasks = await tasksCollection.find({ buyerEmail: email }).toArray();
+        // Each task has totalPayable, title, createdAt
+        const payments = tasks.map(task => ({
+          taskId: task._id,
+          title: task.title,
+          amount: task.totalPayable,
+          coins: task.totalPayable, // coins spent = totalPayable
+          date: task.createdAt || task.created_at || task.created_at,
+        }));
+        // Sort by date descending
+        payments.sort((a, b) => new Date(b.date) - new Date(a.date));
+        res.json(payments);
+      } catch (err) {
+        console.error('Get buyer payments error:', err);
+        res.status(500).json({ error: 'Failed to fetch buyer payments' });
+      }
+    });
+
 
   } catch (err) {
     console.error(err);
