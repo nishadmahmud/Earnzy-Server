@@ -215,17 +215,40 @@ async function run() {
     // Get available tasks for workers
     app.get('/tasks/available', async (req, res) => {
       try {
+        const { workerEmail } = req.query;
+        
         // Get all active tasks where required_workers > 0
         const availableTasks = await tasksCollection.find({
           status: 'active',
           requiredWorkers: { $gt: 0 }
         }).sort({ createdAt: -1 }).toArray();
 
-        // Format completion date for frontend
-        const formattedTasks = availableTasks.map(task => ({
-          ...task,
-          completionDate: task.completionDate.toISOString().split('T')[0] // Format as YYYY-MM-DD
-        }));
+        // If workerEmail is provided, check submission status for each task
+        let formattedTasks = availableTasks;
+        if (workerEmail) {
+          // Get all submissions by this worker
+          const workerSubmissions = await submissionsCollection.find({
+            workerEmail: workerEmail
+          }).toArray();
+          
+          // Create a map of task IDs that the worker has submitted for
+          const submittedTaskIds = new Set(
+            workerSubmissions.map(sub => sub.taskId.toString())
+          );
+
+          // Format tasks and add submission status
+          formattedTasks = availableTasks.map(task => ({
+            ...task,
+            completionDate: task.completionDate.toISOString().split('T')[0], // Format as YYYY-MM-DD
+            hasSubmitted: submittedTaskIds.has(task._id.toString())
+          }));
+        } else {
+          // Format completion date for frontend (no submission status)
+          formattedTasks = availableTasks.map(task => ({
+            ...task,
+            completionDate: task.completionDate.toISOString().split('T')[0] // Format as YYYY-MM-DD
+          }));
+        }
 
         res.json(formattedTasks);
       } catch (err) {
