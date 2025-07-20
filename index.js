@@ -231,16 +231,25 @@ async function run() {
             workerEmail: workerEmail
           }).toArray();
           
-          // Create a map of task IDs that the worker has submitted for
-          const submittedTaskIds = new Set(
-            workerSubmissions.map(sub => sub.taskId.toString())
-          );
+          // Create maps for different submission statuses
+          const submittedTaskIds = new Set();
+          const completedTaskIds = new Set();
+          
+          workerSubmissions.forEach(submission => {
+            const taskId = submission.taskId.toString();
+            if (submission.status === 'approved') {
+              completedTaskIds.add(taskId);
+            } else if (submission.status === 'pending' || submission.status === 'rejected') {
+              submittedTaskIds.add(taskId);
+            }
+          });
 
           // Format tasks and add submission status
           formattedTasks = availableTasks.map(task => ({
             ...task,
             completionDate: task.completionDate.toISOString().split('T')[0], // Format as YYYY-MM-DD
-            hasSubmitted: submittedTaskIds.has(task._id.toString())
+            hasSubmitted: submittedTaskIds.has(task._id.toString()),
+            isCompleted: completedTaskIds.has(task._id.toString())
           }));
         } else {
           // Format completion date for frontend (no submission status)
@@ -261,6 +270,7 @@ async function run() {
     app.get('/tasks/:id', async (req, res) => {
       try {
         const { id } = req.params;
+        const { workerEmail } = req.query;
 
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({ error: 'Invalid task ID' });
@@ -273,10 +283,28 @@ async function run() {
         }
 
         // Format completion date for frontend
-        const formattedTask = {
+        let formattedTask = {
           ...task,
           completionDate: task.completionDate.toISOString().split('T')[0]
         };
+
+        // If workerEmail is provided, check submission status
+        if (workerEmail) {
+          const workerSubmission = await submissionsCollection.findOne({
+            taskId: new ObjectId(id),
+            workerEmail: workerEmail
+          });
+
+          if (workerSubmission) {
+            formattedTask.hasSubmitted = true;
+            formattedTask.isCompleted = workerSubmission.status === 'approved';
+            formattedTask.submissionStatus = workerSubmission.status;
+          } else {
+            formattedTask.hasSubmitted = false;
+            formattedTask.isCompleted = false;
+            formattedTask.submissionStatus = null;
+          }
+        }
 
         res.json(formattedTask);
       } catch (err) {
